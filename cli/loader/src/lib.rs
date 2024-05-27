@@ -1,14 +1,18 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader};
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
-use std::time::SystemTime;
-use std::{env, fs, mem};
+use std::{
+    collections::HashMap,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
+    io::{BufRead, BufReader},
+    mem,
+    ops::Range,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Mutex,
+    time::SystemTime,
+};
 
 use anyhow::{anyhow, Context, Error, Result};
 use fs4::FileExt;
@@ -79,6 +83,7 @@ impl Config {
 }
 
 const BUILD_TARGET: &str = env!("BUILD_TARGET");
+const BUILD_HOST: &str = env!("BUILD_HOST");
 
 pub struct LanguageConfiguration<'a> {
     pub scope: Option<String>,
@@ -126,11 +131,12 @@ pub struct CompileConfig<'a> {
 }
 
 impl<'a> CompileConfig<'a> {
+    #[must_use]
     pub fn new(
         src_path: &'a Path,
         externals: Option<&'a [PathBuf]>,
         output_path: Option<PathBuf>,
-    ) -> CompileConfig<'a> {
+    ) -> Self {
         Self {
             src_path,
             header_paths: vec![src_path],
@@ -138,7 +144,7 @@ impl<'a> CompileConfig<'a> {
             scanner_path: None,
             external_files: externals,
             output_path,
-            flags: &["TREE_SITTER_REUSE_ALLOCATOR", "TREE_SITTER_INTERNAL_BUILD"],
+            flags: &[],
             name: String::new(),
         }
     }
@@ -445,7 +451,7 @@ impl Loader {
         let parser_path = config.src_path.join("parser.c");
         config.scanner_path = self.get_scanner_path(config.src_path);
 
-        let mut paths_to_check = vec![parser_path.clone()];
+        let mut paths_to_check = vec![parser_path];
 
         if let Some(scanner_path) = config.scanner_path.as_ref() {
             paths_to_check.push(scanner_path.clone());
@@ -469,6 +475,7 @@ impl Loader {
             if recompile {
                 self.compile_parser_to_wasm(
                     &config.name,
+                    None,
                     config.src_path,
                     config
                         .scanner_path
@@ -484,7 +491,9 @@ impl Loader {
         }
 
         let lock_path = if env::var("CROSS_RUNNER").is_ok() {
-            PathBuf::from("/tmp")
+            tempfile::tempdir()
+                .unwrap()
+                .path()
                 .join("tree-sitter")
                 .join("lock")
                 .join(format!("{}.lock", config.name))
@@ -499,7 +508,8 @@ impl Loader {
         if let Ok(lock_file) = fs::OpenOptions::new().write(true).open(&lock_path) {
             recompile = false;
             if lock_file.try_lock_exclusive().is_err() {
-                // if we can't acquire the lock, another process is compiling the parser, wait for it and don't recompile
+                // if we can't acquire the lock, another process is compiling the parser, wait for
+                // it and don't recompile
                 lock_file.lock_exclusive()?;
                 recompile = false;
             } else {
@@ -553,16 +563,39 @@ impl Loader {
         lock_file: &fs::File,
         lock_path: &Path,
     ) -> Result<(), Error> {
-        let mut cc = cc::Build::new();
-        cc.cpp(true)
-            .opt_level(2)
+        let mut cc_config = cc::Build::new();
+        cc_config
             .cargo_metadata(false)
             .cargo_warnings(false)
             .target(BUILD_TARGET)
-            .host(BUILD_TARGET)
-            .flag_if_supported("-Werror=implicit-function-declaration");
-        let compiler = cc.get_compiler();
+            .host(BUILD_HOST)
+            .debug(self.debug_build)
+            .file(&config.parser_path)
+            .includes(&config.header_paths);
+
+        if let Some(scanner_path) = config.scanner_path.as_ref() {
+            if scanner_path.extension() != Some("c".as_ref()) {
+                cc_config.cpp(true);
+                eprintln!("Warning: Using a C++ scanner is now deprecated. Please migrate your scanner code to C, as C++ support will be removed in the near future.");
+            } else {
+                cc_config.std("c11");
+            }
+            cc_config.file(scanner_path);
+        }
+
+        if self.debug_build {
+            cc_config.opt_level(0).extra_warnings(true);
+        } else {
+            cc_config.opt_level(2).extra_warnings(false);
+        }
+
+        for flag in config.flags {
+            cc_config.define(flag, None);
+        }
+
+        let compiler = cc_config.get_compiler();
         let mut command = Command::new(compiler.path());
+        command.args(compiler.args());
         for (key, value) in compiler.env() {
             command.env(key, value);
         }
@@ -570,70 +603,23 @@ impl Loader {
         let output_path = config.output_path.as_ref().unwrap();
 
         if compiler.is_like_msvc() {
-            command.args(["/nologo", "/LD"]);
-
-            for path in &config.header_paths {
-                command.arg(format!("/I{}", path.to_string_lossy()));
-            }
-
-            if self.debug_build {
-                command.arg("/Od");
-            } else {
-                command.arg("/O2");
-            }
-            command.arg(&config.parser_path);
-
-            if let Some(scanner_path) = config.scanner_path.as_ref() {
-                if scanner_path.extension() != Some("c".as_ref()) {
-                    eprintln!("Warning: Using a C++ scanner is now deprecated. Please migrate your scanner code to C, as C++ support will be removed in the near future.");
-                }
-
-                command.arg(scanner_path);
-            }
-            command
-                .arg("/link")
-                .arg(format!("/out:{}", output_path.to_str().unwrap()));
+            let out = format!("-out:{}", output_path.to_str().unwrap());
+            command.arg(if self.debug_build { "-LDd" } else { "-LD" });
+            command.arg("-utf-8");
+            command.args(cc_config.get_files());
+            command.arg("-link").arg(out);
         } else {
-            command
-                .arg("-shared")
-                .arg("-fno-exceptions")
-                .arg("-g")
-                .arg("-o")
-                .arg(output_path);
-
-            for path in &config.header_paths {
-                command.arg(format!("-I{}", path.to_string_lossy()));
-            }
-
-            if !cfg!(windows) {
-                command.arg("-fPIC");
-            }
-
-            if self.debug_build {
-                command.arg("-O0");
+            command.arg("-Werror=implicit-function-declaration");
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                command.arg("-dynamiclib");
+                // TODO: remove when supported
+                command.arg("-UTREE_SITTER_REUSE_ALLOCATOR");
             } else {
-                command.arg("-O2");
+                command.arg("-shared");
             }
-
-            if let Some(scanner_path) = config.scanner_path.as_ref() {
-                if scanner_path.extension() == Some("c".as_ref()) {
-                    command.arg("-xc").arg("-std=c11").arg(scanner_path);
-                } else {
-                    eprintln!("Warning: Using a C++ scanner is now deprecated. Please migrate your scanner code to C, as C++ support will be removed in the near future.");
-                    command.arg(scanner_path);
-                }
-            }
-            command.arg("-xc").arg(&config.parser_path);
+            command.args(cc_config.get_files());
+            command.arg("-o").arg(output_path);
         }
-
-        // For conditional compilation of external scanner code when
-        // used internally by `tree-sitter parse` and other sub commands.
-        command.arg("-DTREE_SITTER_INTERNAL_BUILD");
-
-        // Always use the same allocator in the CLI as any scanner, useful for debugging and
-        // tracking memory leaks in tests.
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        command.arg("-DTREE_SITTER_REUSE_ALLOCATOR");
 
         let output = command.output().with_context(|| {
             format!("Failed to execute the C compiler with the following command:\n{command:?}")
@@ -642,20 +628,24 @@ impl Loader {
         lock_file.unlock()?;
         fs::remove_file(lock_path)?;
 
-        if !output.status.success() {
-            return Err(anyhow!(
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
                 "Parser compilation failed.\nStdout: {}\nStderr: {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
-            ));
+            ))
         }
-
-        Ok(())
     }
 
     #[cfg(unix)]
     fn check_external_scanner(&self, name: &str, library_path: &Path) -> Result<()> {
-        let prefix = if cfg!(target_os = "macos") { "_" } else { "" };
+        let prefix = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            "_"
+        } else {
+            ""
+        };
         let mut must_have = vec![
             format!("{prefix}tree_sitter_{name}_external_scanner_create"),
             format!("{prefix}tree_sitter_{name}_external_scanner_destroy"),
@@ -735,6 +725,7 @@ impl Loader {
     pub fn compile_parser_to_wasm(
         &self,
         language_name: &str,
+        root_path: Option<&Path>,
         src_path: &Path,
         scanner_filename: Option<&Path>,
         output_path: &Path,
@@ -747,6 +738,7 @@ impl Loader {
             Podman,
         }
 
+        let root_path = root_path.unwrap_or(src_path);
         let emcc_name = if cfg!(windows) { "emcc.bat" } else { "emcc" };
 
         // Order of preference: emscripten > docker > podman > error
@@ -785,10 +777,18 @@ impl Loader {
                 };
                 command.args(["run", "--rm"]);
 
-                // Mount the parser directory as a volume
-                command.args(["--workdir", "/src"]);
+                // The working directory is the directory containing the parser itself
+                let workdir = if root_path == src_path {
+                    PathBuf::from("/src")
+                } else {
+                    let mut path = PathBuf::from("/src");
+                    path.push(src_path.strip_prefix(root_path).unwrap());
+                    path
+                };
+                command.args(["--workdir", &workdir.to_string_lossy()]);
 
-                let mut volume_string = OsString::from(&src_path);
+                // Mount the root directory as a volume, which is the repo root
+                let mut volume_string = OsString::from(&root_path);
                 volume_string.push(":/src:Z");
                 command.args([OsStr::new("--volume"), &volume_string]);
 
@@ -1015,7 +1015,7 @@ impl Loader {
                         language_name: grammar_json.name.clone(),
                         scope: config_json.scope,
                         language_id,
-                        file_types: config_json.file_types.unwrap_or(Vec::new()),
+                        file_types: config_json.file_types.unwrap_or_default(),
                         content_regex: Self::regex(config_json.content_regex.as_deref()),
                         first_line_regex: Self::regex(config_json.first_line_regex.as_deref()),
                         injection_regex: Self::regex(config_json.injection_regex.as_deref()),
@@ -1042,8 +1042,11 @@ impl Loader {
                             .push(self.language_configurations.len());
                     }
 
-                    self.language_configurations
-                        .push(unsafe { mem::transmute(configuration) });
+                    self.language_configurations.push(unsafe {
+                        mem::transmute::<LanguageConfiguration<'_>, LanguageConfiguration<'static>>(
+                            configuration,
+                        )
+                    });
 
                     if set_current_path_config
                         && self.language_configuration_in_current_path.is_none()
@@ -1082,8 +1085,11 @@ impl Loader {
                 highlight_names: &self.highlight_names,
                 use_all_highlight_names: self.use_all_highlight_names,
             };
-            self.language_configurations
-                .push(unsafe { mem::transmute(configuration) });
+            self.language_configurations.push(unsafe {
+                mem::transmute::<LanguageConfiguration<'_>, LanguageConfiguration<'static>>(
+                    configuration,
+                )
+            });
             self.languages_by_id
                 .push((parser_path.to_owned(), OnceCell::new(), None));
         }
@@ -1321,8 +1327,7 @@ impl<'a> LanguageConfiguration<'a> {
             .unwrap_or_else(|| ranges.last().unwrap());
         error.offset = offset_within_section - range.start;
         error.row = source[range.start..offset_within_section]
-            .chars()
-            .filter(|c| *c == '\n')
+            .matches(|c| c == '\n')
             .count();
         Error::from(error).context(format!("Error in query file {path:?}"))
     }

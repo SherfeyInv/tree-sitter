@@ -1,19 +1,25 @@
-use super::util;
-use ansi_term::Colour;
+use std::{
+    collections::{BTreeMap, HashSet},
+    ffi::OsStr,
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    str,
+};
+
+use anstyle::{AnsiColor, Color, Style};
 use anyhow::{anyhow, Context, Result};
-use difference::{Changeset, Difference};
 use indoc::indoc;
 use lazy_static::lazy_static;
-use regex::bytes::{Regex as ByteRegex, RegexBuilder as ByteRegexBuilder};
-use regex::Regex;
-use std::collections::BTreeMap;
-use std::ffi::OsStr;
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::str;
+use regex::{
+    bytes::{Regex as ByteRegex, RegexBuilder as ByteRegexBuilder},
+    Regex,
+};
+use similar::{ChangeTag, TextDiff};
 use tree_sitter::{format_sexp, Language, LogType, Parser, Query};
 use walkdir::WalkDir;
+
+use super::util;
 
 lazy_static! {
     static ref HEADER_REGEX: ByteRegex = ByteRegexBuilder::new(
@@ -21,8 +27,7 @@ lazy_static! {
            (?P<equals>(?:=+){3,})
            (?P<suffix1>[^=\r\n][^\r\n]*)?
            \r?\n
-           (?P<test_name>(?:[^=\r\n:][^\r\n]*\r?\n)+(?:(?:[ \t]*\r?\n)+)?)
-           (?P<markers>((?::(?:skip|error|fail-fast|(language|platform)\([^\r\n)]+\))\r?\n)*))
+           (?P<test_name_and_markers>(?:[^=][^\r\n]*\r?\n)+)
            ===+
            (?P<suffix2>[^=\r\n][^\r\n]*)?\r?\n"
     )
@@ -99,6 +104,8 @@ pub struct TestOptions<'a> {
     pub update: bool,
     pub open_log: bool,
     pub languages: BTreeMap<&'a str, &'a Language>,
+    pub color: bool,
+    pub test_num: usize,
 }
 
 pub fn run_tests_at_path(parser: &mut Parser, opts: &mut TestOptions) -> Result<()> {
@@ -159,12 +166,14 @@ pub fn run_tests_at_path(parser: &mut Parser, opts: &mut TestOptions) -> Result<
                 }
             }
 
-            print_diff_key();
+            if opts.color {
+                print_diff_key();
+            }
             for (i, (name, actual, expected)) in failures.iter().enumerate() {
                 println!("\n  {}. {name}:", i + 1);
                 let actual = format_sexp(actual, 2);
                 let expected = format_sexp(expected, 2);
-                print_diff(&actual, &expected);
+                print_diff(&actual, &expected, opts.color);
             }
 
             if has_parse_errors {
@@ -176,6 +185,65 @@ pub fn run_tests_at_path(parser: &mut Parser, opts: &mut TestOptions) -> Result<
             }
         }
     }
+}
+
+#[allow(clippy::type_complexity)]
+pub fn get_test_info<'test>(
+    test_entry: &'test TestEntry,
+    target_test: u32,
+    test_num: &mut u32,
+) -> Option<(&'test str, &'test [u8], Vec<Box<str>>)> {
+    match test_entry {
+        TestEntry::Example {
+            name,
+            input,
+            attributes,
+            ..
+        } => {
+            if *test_num == target_test {
+                return Some((name, input, attributes.languages.clone()));
+            } else {
+                *test_num += 1;
+            }
+        }
+        TestEntry::Group { children, .. } => {
+            for child in children {
+                if let Some((name, input, languages)) = get_test_info(child, target_test, test_num)
+                {
+                    return Some((name, input, languages));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Writes the input of `target_test` to a temporary file and returns the path
+pub fn get_tmp_test_file(target_test: u32, color: bool) -> Result<(PathBuf, Vec<Box<str>>)> {
+    let current_dir = std::env::current_dir().unwrap();
+    let test_dir = current_dir.join("test").join("corpus");
+
+    // Get the input of the target test
+    let test_entry = parse_tests(&test_dir)?;
+    let mut test_num = 0;
+    let Some((test_name, test_contents, languages)) =
+        get_test_info(&test_entry, target_test - 1, &mut test_num)
+    else {
+        return Err(anyhow!("Failed to fetch contents of test #{target_test}"));
+    };
+
+    // Write the test contents to a temporary file
+    let test_path = std::env::temp_dir().join(".tree-sitter-test");
+    let mut test_file = std::fs::File::create(&test_path)?;
+    test_file.write_all(test_contents)?;
+
+    println!(
+        "{target_test}. {}\n",
+        paint(color.then_some(AnsiColor::Green), test_name)
+    );
+
+    Ok((test_path, languages))
 }
 
 pub fn check_queries_at_path(language: &Language, path: &Path) -> Result<()> {
@@ -202,29 +270,55 @@ pub fn check_queries_at_path(language: &Language, path: &Path) -> Result<()> {
 pub fn print_diff_key() {
     println!(
         "\ncorrect / {} / {}",
-        Colour::Green.paint("expected"),
-        Colour::Red.paint("unexpected")
+        paint(Some(AnsiColor::Green), "expected"),
+        paint(Some(AnsiColor::Red), "unexpected")
     );
 }
 
-pub fn print_diff(actual: &str, expected: &str) {
-    let changeset = Changeset::new(actual, expected, "\n");
-    for diff in &changeset.diffs {
-        match diff {
-            Difference::Same(part) => {
-                print!("{part}{}", changeset.split);
+pub fn print_diff(actual: &str, expected: &str, use_color: bool) {
+    let diff = TextDiff::from_lines(actual, expected);
+    for diff in diff.iter_all_changes() {
+        match diff.tag() {
+            ChangeTag::Equal => {
+                if use_color {
+                    print!("{diff}");
+                } else {
+                    print!(" {diff}");
+                }
             }
-            Difference::Add(part) => {
-                print!("{}{}", Colour::Green.paint(part), changeset.split);
+            ChangeTag::Insert => {
+                if use_color {
+                    print!("{}", paint(Some(AnsiColor::Green), diff.as_str().unwrap()));
+                } else {
+                    print!("+{diff}");
+                }
+                if diff.missing_newline() {
+                    println!();
+                }
             }
-            Difference::Rem(part) => {
-                print!("{}{}", Colour::Red.paint(part), changeset.split);
+            ChangeTag::Delete => {
+                if use_color {
+                    print!("{}", paint(Some(AnsiColor::Red), diff.as_str().unwrap()));
+                } else {
+                    print!("-{diff}");
+                }
+                if diff.missing_newline() {
+                    println!();
+                }
             }
         }
     }
+
     println!();
 }
 
+pub fn paint(color: Option<AnsiColor>, text: &str) -> String {
+    let style = Style::new().fg_color(color.map(Color::Ansi));
+    format!("{style}{text}{style:#}")
+}
+
+/// This will return false if we want to "fail fast". It will bail and not parse any more tests.
+#[allow(clippy::too_many_arguments)]
 fn run_tests(
     parser: &mut Parser,
     test_entry: TestEntry,
@@ -247,12 +341,20 @@ fn run_tests(
             print!("{}", "  ".repeat(indent_level as usize));
 
             if attributes.skip {
-                println!(" {}", Colour::Yellow.paint(&name));
+                println!(
+                    "{:>3}.  {}",
+                    opts.test_num,
+                    paint(opts.color.then_some(AnsiColor::Yellow), &name),
+                );
                 return Ok(true);
             }
 
             if !attributes.platform {
-                println!(" {}", Colour::Purple.paint(&name));
+                println!(
+                    "{:>3}.  {}",
+                    opts.test_num,
+                    paint(opts.color.then_some(AnsiColor::Magenta), &name),
+                );
                 return Ok(true);
             }
 
@@ -268,9 +370,17 @@ fn run_tests(
 
                 if attributes.error {
                     if tree.root_node().has_error() {
-                        println!(" {}", Colour::Green.paint(&name));
+                        println!(
+                            "{:>3}.  {}",
+                            opts.test_num,
+                            paint(opts.color.then_some(AnsiColor::Green), &name)
+                        );
                     } else {
-                        println!(" {}", Colour::Red.paint(&name));
+                        println!(
+                            "{:>3}.  {}",
+                            opts.test_num,
+                            paint(opts.color.then_some(AnsiColor::Red), &name)
+                        );
                     }
 
                     if attributes.fail_fast {
@@ -283,7 +393,11 @@ fn run_tests(
                     }
 
                     if actual == output {
-                        println!("✓ {}", Colour::Green.paint(&name));
+                        println!(
+                            "{:>3}. ✓ {}",
+                            opts.test_num,
+                            paint(opts.color.then_some(AnsiColor::Green), &name)
+                        );
                         if opts.update {
                             let input = String::from_utf8(input.clone()).unwrap();
                             let output = format_sexp(&output, 0);
@@ -301,13 +415,15 @@ fn run_tests(
                             let expected_output = format_sexp(&output, 0);
                             let actual_output = format_sexp(&actual, 0);
 
-                            // Only bail early before updating if the actual is not the output, sometimes
-                            // users want to test cases that are intended to have errors, hence why this
+                            // Only bail early before updating if the actual is not the output,
+                            // sometimes users want to test cases that
+                            // are intended to have errors, hence why this
                             // check isn't shown above
                             if actual.contains("ERROR") || actual.contains("MISSING") {
                                 *has_parse_errors = true;
 
-                                // keep the original `expected` output if the actual output has an error
+                                // keep the original `expected` output if the actual output has an
+                                // error
                                 corrected_entries.push((
                                     name.clone(),
                                     input,
@@ -323,53 +439,77 @@ fn run_tests(
                                     header_delim_len,
                                     divider_delim_len,
                                 ));
-                                println!("✓ {}", Colour::Blue.paint(&name));
+                                println!(
+                                    "{:>3}. ✓ {}",
+                                    opts.test_num,
+                                    paint(opts.color.then_some(AnsiColor::Blue), &name),
+                                );
                             }
                         } else {
-                            println!("✗ {}", Colour::Red.paint(&name));
+                            println!(
+                                "{:>3}. ✗ {}",
+                                opts.test_num,
+                                paint(opts.color.then_some(AnsiColor::Red), &name),
+                            );
                         }
                         failures.push((name.clone(), actual, output.clone()));
 
                         if attributes.fail_fast {
-                            // return value of false means to fail fast
                             return Ok(false);
-                        }
-
-                        if i == attributes.languages.len() - 1 {
-                            // reset back to first language
-                            parser.set_language(opts.languages.values().next().unwrap())?;
                         }
                     }
                 }
+
+                if i == attributes.languages.len() - 1 {
+                    // reset to the first language
+                    parser.set_language(opts.languages.values().next().unwrap())?;
+                }
             }
+            opts.test_num += 1;
         }
         TestEntry::Group {
             name,
             mut children,
             file_path,
         } => {
-            children.retain(|child| {
-                if let TestEntry::Example { name, .. } = child {
+            // track which tests are being skipped to maintain consistent numbering while using
+            // filters
+            let mut skipped_tests = HashSet::new();
+            let mut advance_counter = opts.test_num;
+            children.retain(|child| match child {
+                TestEntry::Example { name, .. } => {
                     if let Some(filter) = opts.filter {
                         if !name.contains(filter) {
+                            skipped_tests.insert(advance_counter);
+                            advance_counter += 1;
                             return false;
                         }
                     }
                     if let Some(include) = &opts.include {
                         if !include.is_match(name) {
+                            skipped_tests.insert(advance_counter);
+                            advance_counter += 1;
                             return false;
                         }
                     }
                     if let Some(exclude) = &opts.exclude {
                         if exclude.is_match(name) {
+                            skipped_tests.insert(advance_counter);
+                            advance_counter += 1;
                             return false;
                         }
                     }
+                    advance_counter += 1;
+                    true
                 }
-                true
+                TestEntry::Group { .. } => {
+                    advance_counter += count_subtests(child);
+                    true
+                }
             });
 
             if children.is_empty() {
+                opts.test_num = advance_counter;
                 return Ok(true);
             }
 
@@ -382,6 +522,11 @@ fn run_tests(
 
             indent_level += 1;
             for child in children {
+                if let TestEntry::Example { .. } = child {
+                    while skipped_tests.remove(&opts.test_num) {
+                        opts.test_num += 1;
+                    }
+                }
                 if !run_tests(
                     parser,
                     child,
@@ -396,6 +541,8 @@ fn run_tests(
                 }
             }
 
+            opts.test_num += skipped_tests.len();
+
             if let Some(file_path) = file_path {
                 if opts.update && failures.len() - failure_count > 0 {
                     write_tests(&file_path, corrected_entries)?;
@@ -405,6 +552,15 @@ fn run_tests(
         }
     }
     Ok(true)
+}
+
+fn count_subtests(test_entry: &TestEntry) -> usize {
+    match test_entry {
+        TestEntry::Example { .. } => 1,
+        TestEntry::Group { children, .. } => children
+            .iter()
+            .fold(0, |count, child| count + count_subtests(child)),
+    }
 }
 
 fn write_tests(
@@ -425,9 +581,9 @@ fn write_tests_to_buffer(
         if i > 0 {
             writeln!(buffer)?;
         }
-        write!(
+        writeln!(
             buffer,
-            "{}\n{name}\n{}\n{input}\n{}\n\n{}\n",
+            "{}\n{name}\n{}\n{input}\n{}\n\n{}",
             "=".repeat(*header_delim_len),
             "=".repeat(*header_delim_len),
             "-".repeat(*divider_delim_len),
@@ -511,28 +667,45 @@ fn parse_test_content(name: String, content: &str, file_path: Option<PathBuf>) -
         let (mut skip, mut platform, mut fail_fast, mut error, mut languages) =
             (false, None, false, false, vec![]);
 
-        let markers = c.name("markers").map_or("".as_bytes(), |m| m.as_bytes());
+        let test_name_and_markers = c
+            .name("test_name_and_markers")
+            .map_or("".as_bytes(), |m| m.as_bytes());
 
-        for marker in markers.split(|&c| c == b'\n').filter(|s| !s.is_empty()) {
-            let marker = str::from_utf8(marker).unwrap();
-            let (marker, right) = marker.split_at(marker.find('(').unwrap_or(marker.len()));
-            match marker {
-                ":skip" => skip = true,
+        let mut test_name = String::new();
+        let mut seen_marker = false;
+
+        for line in str::from_utf8(test_name_and_markers)
+            .unwrap()
+            .lines()
+            .filter(|s| !s.is_empty())
+        {
+            match line.split('(').next().unwrap() {
+                ":skip" => (seen_marker, skip) = (true, true),
                 ":platform" => {
-                    if let Some(platforms) =
-                        right.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
-                    {
+                    if let Some(platforms) = line.strip_prefix(':').and_then(|s| {
+                        s.strip_prefix("platform(")
+                            .and_then(|s| s.strip_suffix(')'))
+                    }) {
+                        seen_marker = true;
                         platform = Some(
                             platform.unwrap_or(false) || platforms.trim() == std::env::consts::OS,
                         );
                     }
                 }
-                ":fail-fast" => fail_fast = true,
-                ":error" => error = true,
+                ":fail-fast" => (seen_marker, fail_fast) = (true, true),
+                ":error" => (seen_marker, error) = (true, true),
                 ":language" => {
-                    if let Some(lang) = right.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                    if let Some(lang) = line.strip_prefix(':').and_then(|s| {
+                        s.strip_prefix("language(")
+                            .and_then(|s| s.strip_suffix(')'))
+                    }) {
+                        seen_marker = true;
                         languages.push(lang.into());
                     }
+                }
+                _ if !seen_marker => {
+                    test_name.push_str(line);
+                    test_name.push('\n');
                 }
                 _ => {}
             }
@@ -550,9 +723,11 @@ fn parse_test_content(name: String, content: &str, file_path: Option<PathBuf>) -
 
         if suffix1 == first_suffix && suffix2 == first_suffix {
             let header_range = c.get(0).unwrap().range();
-            let test_name = c
-                .name("test_name")
-                .map(|c| String::from_utf8_lossy(c.as_bytes()).trim_end().to_string());
+            let test_name = if test_name.is_empty() {
+                None
+            } else {
+                Some(test_name.trim_end().to_string())
+            };
             Some((
                 header_delim_len,
                 header_range,
@@ -636,7 +811,7 @@ fn parse_test_content(name: String, content: &str, file_path: Option<PathBuf>) -
             }
         }
         prev_attributes = attributes;
-        prev_name = test_name.unwrap_or(String::new());
+        prev_name = test_name.unwrap_or_default();
         prev_header_len = header_delim_len;
         prev_header_end = header_range.end;
     }

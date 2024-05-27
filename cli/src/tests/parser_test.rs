@@ -1,20 +1,21 @@
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    thread, time,
+};
+
+use tree_sitter::{IncludedRangesError, InputEdit, LogType, Parser, Point, Range};
+use tree_sitter_proc_macro::retry;
+
 use super::helpers::{
     allocations,
     edits::{invert_edit, ReadRecorder},
     fixtures::{get_language, get_test_language},
 };
 use crate::{
-    generate::generate_parser_for_grammar,
+    generate::{generate_parser_for_grammar, load_grammar_file},
     parse::{perform_edit, Edit},
     tests::helpers::fixtures::fixtures_dir,
 };
-use std::{
-    fs,
-    sync::atomic::{AtomicUsize, Ordering},
-    thread, time,
-};
-use tree_sitter::{IncludedRangesError, InputEdit, LogType, Parser, Point, Range};
-use tree_sitter_proc_macro::retry;
 
 #[test]
 fn test_parsing_simple_string() {
@@ -97,7 +98,7 @@ fn test_parsing_with_debug_graph_enabled() {
     parser.print_dot_graphs(&debug_graph_file);
     parser.parse("const zero = 0", None).unwrap();
 
-    debug_graph_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    debug_graph_file.rewind().unwrap();
     let log_reader = BufReader::new(debug_graph_file)
         .lines()
         .map(|l| l.expect("Failed to read line from graph log"));
@@ -430,8 +431,8 @@ fn test_parsing_after_editing_tree_that_depends_on_column_values() {
     let dir = fixtures_dir()
         .join("test_grammars")
         .join("uses_current_column");
-    let grammar = fs::read_to_string(dir.join("grammar.json")).unwrap();
-    let (grammar_name, parser_code) = generate_parser_for_grammar(&grammar).unwrap();
+    let grammar_json = load_grammar_file(&dir.join("grammar.js"), None).unwrap();
+    let (grammar_name, parser_code) = generate_parser_for_grammar(&grammar_json).unwrap();
 
     let mut parser = Parser::new();
     parser
